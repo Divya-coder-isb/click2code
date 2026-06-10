@@ -1,523 +1,317 @@
-"""Gemini integration for mockscreen-to-code-agent.
+"""Core agent logic for the MockScreen-to-Code Generator.
 
-This module is responsible for:
+This module is the brain of the project. It accepts 1–3 PIL mockup images and
+a target tech stack ("Streamlit", "React", or "Flask"), sends them to
+Google Gemini 1.5 Flash (vision-capable), and returns a structured dict with
+all the generated files plus a short explanation.
 
-- Resolving the Gemini API key from `st.secrets` or `os.environ`.
-- Validating uploaded mock screen images (1-3 png/jpg/jpeg/webp files).
-- Building a multimodal request that combines the system instruction, the
-  target stack, optional extra instructions, and the uploaded images as
-  inline image parts.
-- Calling Google Gemini through the official `google-genai` SDK with strict
-  JSON output enabled.
-- Robustly extracting a JSON object from the model's response (raw JSON,
-  ```json fences, generic ``` fences, or JSON embedded inside prose).
-- Validating that the parsed payload matches the documented schema and
-  returning a plain `dict` to the caller.
+Public API
+----------
+- ``generate_code_from_mockscreen(images, tech_stack, ...)`` → dict
+- ``create_zip_download(files)`` → bytes
 
-The module **never** executes generated code and **never** writes generated
-files to disk. Those responsibilities live in `app.py` and `file_builder.py`.
+Both functions are designed to be called directly from a Streamlit app.
 """
 
 from __future__ import annotations
 
-import json
-import logging
+import io
 import os
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+import zipfile
+from typing import Optional
 
-from prompt_templates import SYSTEM_INSTRUCTION, build_generation_prompt
-from validators import validate_generated_result
+import google.generativeai as genai
+from dotenv import load_dotenv
+from PIL import Image
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
-
-DEFAULT_MODEL = "gemini-2.5-flash"
-
-MIN_IMAGES = 1
-MAX_IMAGES = 3
-
-ALLOWED_EXTENSIONS = ("png", "jpg", "jpeg", "webp")
-ALLOWED_MIME_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp")
-ALLOWED_STACKS = ("streamlit", "react", "flask")
-
-_EXTENSION_TO_MIME: Dict[str, str] = {
-    "png": "image/png",
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "webp": "image/webp",
-}
+load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# Errors
+# Configuration
 # ---------------------------------------------------------------------------
 
+MODEL_NAME = "gemini-1.5-flash"
+"""Gemini model used for vision + code generation."""
 
-class GeminiAPIError(RuntimeError):
-    """Raised when the Gemini API call fails (auth, network, SDK)."""
+SUPPORTED_TECH_STACKS: tuple[str, ...] = ("Streamlit", "React", "Flask")
+"""Tech stacks the agent knows how to scaffold."""
 
-
-class RateLimitError(ValueError):
-    """Raised when Gemini responds with 429 / RESOURCE_EXHAUSTED / quota.
-
-    Subclasses `ValueError` so existing handlers that catch `ValueError`
-    continue to display the message without changes, but lets callers
-    branch on a rate-limit failure specifically (e.g. to show a softer
-    `st.warning` instead of a red `st.error`).
-
-    Rate-limit errors are **never** auto-retried by this module — the
-    free tier requires a full ~60s wait. Surfacing the error and letting
-    the user retry manually is the intended UX.
-    """
+_API_KEY_PLACEHOLDER = "your_gemini_api_key_here"
 
 
-RATE_LIMIT_MESSAGE = (
-    "Rate limit exceeded. You are making requests too quickly for the "
-    "free tier. Please wait 60 seconds and try again. Consider uploading "
-    "fewer images to save tokens."
-)
+def _configure_gemini(api_key: Optional[str] = None) -> None:
+    """Configure the ``google-generativeai`` client.
 
+    The key is resolved in this order:
 
-def _is_rate_limit_error(exc: BaseException) -> bool:
-    """Heuristic check for a Gemini 429 / RESOURCE_EXHAUSTED / quota error.
-
-    Different parts of the `google-genai` stack expose the status code in
-    different attributes (`code`, `status_code`, `http_status`, `status`)
-    and sometimes only via the stringified message. We check both.
-    """
-    for attr in ("code", "status_code", "http_status", "status"):
-        value = getattr(exc, attr, None)
-        if value == 429:
-            return True
-        if isinstance(value, str) and "429" in value:
-            return True
-
-    message = str(exc)
-    if "429" in message:
-        return True
-    if "RESOURCE_EXHAUSTED" in message:
-        return True
-    if "quota" in message.lower():
-        return True
-    return False
-
-
-# Note: other invalid-response / shape issues are intentionally raised as
-# plain `ValueError` so callers can rely on a stable, well-known exception
-# type for "the model gave us something we couldn't use".
-
-
-# ---------------------------------------------------------------------------
-# API key resolution
-# ---------------------------------------------------------------------------
-
-
-def get_api_key() -> Optional[str]:
-    """Resolve the Gemini API key.
-
-    Lookup order:
-    1. `st.secrets["GEMINI_API_KEY"]` when Streamlit is importable and the
-       secret is set (i.e. the user has a `.streamlit/secrets.toml`).
-    2. `os.environ["GEMINI_API_KEY"]` as a fallback.
-
-    Returns:
-        The key string, or `None` if not found in either location.
-
-    The key value itself is never logged or echoed.
-    """
-    # Try Streamlit secrets first. We import Streamlit lazily so this module
-    # remains useful in non-Streamlit contexts (CLI, tests, notebooks).
-    try:
-        import streamlit as st  # type: ignore
-
-        try:
-            if "GEMINI_API_KEY" in st.secrets:
-                value = st.secrets["GEMINI_API_KEY"]
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-        except Exception:
-            # st.secrets raises if no secrets.toml is configured.
-            pass
-    except ImportError:
-        pass
-
-    env_value = os.environ.get("GEMINI_API_KEY")
-    if env_value and env_value.strip():
-        return env_value.strip()
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Image normalization
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _ImagePart:
-    """Internal representation of a single uploaded image."""
-
-    name: str
-    data: bytes
-    mime_type: str
-
-
-def _guess_mime_type(filename: str, declared: Optional[str] = None) -> str:
-    """Infer a MIME type from a declared metadata value or the file extension.
-
-    `image/jpg` (non-standard but common) is normalized to `image/jpeg`.
-    Falls back to `image/png` when no signal is available.
-    """
-    if isinstance(declared, str):
-        normalized = declared.strip().lower()
-        if normalized == "image/jpg":
-            return "image/jpeg"
-        if normalized in {"image/png", "image/jpeg", "image/webp"}:
-            return normalized
-
-    if "." in filename:
-        ext = filename.rsplit(".", 1)[-1].lower()
-        if ext in _EXTENSION_TO_MIME:
-            return _EXTENSION_TO_MIME[ext]
-    return "image/png"
-
-
-def _read_bytes(uploaded_file: Any) -> bytes:
-    """Extract raw bytes from a Streamlit UploadedFile or any file-like object."""
-    if hasattr(uploaded_file, "getvalue"):
-        return uploaded_file.getvalue()
-    if hasattr(uploaded_file, "read"):
-        data = uploaded_file.read()
-        if hasattr(uploaded_file, "seek"):
-            try:
-                uploaded_file.seek(0)
-            except Exception:
-                pass
-        return data
-    raise ValueError(
-        f"Uploaded file {getattr(uploaded_file, 'name', uploaded_file)!r} "
-        "is not readable."
-    )
-
-
-def _normalize_uploaded_files(uploaded_files: Any) -> List[_ImagePart]:
-    """Validate count and types, load bytes, and return image parts.
+    1. Explicit ``api_key`` argument (used when a user pastes a key into the
+       Streamlit sidebar).
+    2. ``GEMINI_API_KEY`` from the environment (loaded from ``.env`` at module
+       import via ``python-dotenv``).
 
     Raises:
-        ValueError: when the count is out of range or any file is not a
-            supported image type / is empty.
+        ValueError: If no usable API key can be found.
     """
-    if uploaded_files is None:
+    key = api_key or os.getenv("GEMINI_API_KEY")
+    if not key or key.strip() in ("", _API_KEY_PLACEHOLDER):
         raise ValueError(
-            f"Please upload at least {MIN_IMAGES} mock screen image."
+            "GEMINI_API_KEY is not set. Add it to your .env file or pass it "
+            "explicitly via the sidebar."
         )
-
-    # Allow a single UploadedFile to be passed without a list wrapper.
-    if not isinstance(uploaded_files, (list, tuple)):
-        uploaded_files = [uploaded_files]
-
-    files = [f for f in uploaded_files if f is not None]
-
-    if len(files) < MIN_IMAGES:
-        raise ValueError(
-            f"Please upload at least {MIN_IMAGES} mock screen image."
-        )
-    if len(files) > MAX_IMAGES:
-        raise ValueError(
-            f"Too many images: {len(files)}. Maximum allowed is {MAX_IMAGES}."
-        )
-
-    parts: List[_ImagePart] = []
-    for f in files:
-        name = getattr(f, "name", "image")
-        declared_mime = getattr(f, "type", None)
-
-        ext_ok = (
-            "." in name
-            and name.rsplit(".", 1)[-1].lower() in ALLOWED_EXTENSIONS
-        )
-        mime_ok = (
-            isinstance(declared_mime, str)
-            and declared_mime.strip().lower() in ALLOWED_MIME_TYPES
-        )
-        if not (ext_ok or mime_ok):
-            raise ValueError(
-                f"'{name}' is not a supported image type. "
-                f"Allowed extensions: {', '.join(ALLOWED_EXTENSIONS)}."
-            )
-
-        data = _read_bytes(f)
-        if not data:
-            raise ValueError(f"'{name}' is empty.")
-
-        parts.append(
-            _ImagePart(
-                name=name,
-                data=data,
-                mime_type=_guess_mime_type(name, declared_mime),
-            )
-        )
-
-    return parts
+    genai.configure(api_key=key)
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction
+# Prompts
 # ---------------------------------------------------------------------------
 
-_FENCE_RE = re.compile(
-    r"```(?:json|JSON)?\s*(?P<body>.*?)\s*```",
+SYSTEM_PROMPT_BASE = (
+    "You are an expert UI/UX engineer and senior full-stack developer. "
+    "You will be shown one or more screenshots or mockups of a user "
+    "interface. Your job is to recreate that UI as production-quality "
+    "code that runs end-to-end after a single install step. "
+    "Pay close attention to exact layout, hierarchy, spacing, alignment, "
+    "typography, color palette, icons, and interactive states. "
+    "Write idiomatic, well-organized, accessible code — never skeletons "
+    "or TODO stubs."
+)
+
+STREAMLIT_PROMPT = """\
+TARGET STACK: Streamlit (Python)
+
+Files to emit (at minimum):
+  - app.py            full Streamlit application; the only required Python file
+  - requirements.txt  streamlit plus every other library you actually import
+  - README.md         one-paragraph install + run instructions
+
+Streamlit implementation rules:
+- Start with `st.set_page_config(...)` (title, icon, layout).
+- Use `import streamlit as st` and any of: pandas, numpy, plotly, altair, etc.
+  Add every import to `requirements.txt`.
+- Map the mockup to Streamlit widgets faithfully:
+    * Layout: `st.columns`, `st.container`, `st.tabs`, `st.expander`,
+      `st.sidebar`.
+    * Typography: `st.title`, `st.header`, `st.subheader`, `st.markdown`,
+      `st.caption`.
+    * Inputs: `st.button`, `st.text_input`, `st.text_area`, `st.selectbox`,
+      `st.multiselect`, `st.checkbox`, `st.radio`, `st.slider`,
+      `st.date_input`, `st.file_uploader`, `st.form`.
+    * Data / visuals: `st.metric`, `st.dataframe`, `st.table`, `st.image`,
+      `st.line_chart`, `st.bar_chart`, `st.area_chart`, `st.progress`.
+- Include realistic placeholder data so the rendered page looks like the
+  mockup (lists of dicts, hand-built pandas DataFrames, JSON literals).
+  Never leave widgets dangling without data.
+- Wire up genuine interactivity using `st.session_state` (button clicks,
+  form submissions, tab/screen switches).
+- If the default theme cannot match the mockup's palette, inject a small
+  CSS block with `st.markdown(..., unsafe_allow_html=True)` near the top
+  of `app.py`.
+- If multiple mockup images are provided, model each as a separate
+  `st.tabs` tab OR a separate sidebar-navigated page (use `st.session_state`
+  to remember the active page).
+"""
+
+REACT_PROMPT = """\
+TARGET STACK: React (JavaScript, functional components + hooks)
+
+Project layout to emit (Vite-style; runs with `npm install && npm run dev`):
+  - package.json
+  - vite.config.js
+  - index.html                       includes the Tailwind CDN script
+  - src/main.jsx                     mounts <App /> via ReactDOM.createRoot
+  - src/App.jsx                      top-level component / lightweight router
+  - src/components/<Screen>.jsx      one per mockup screen when >1 image
+  - src/index.css                    minimal global resets (optional)
+  - README.md
+
+React implementation rules:
+- React 18 only. Functional components and hooks (`useState`, `useEffect`,
+  `useMemo`, `useReducer`) — no class components.
+- Style with **Tailwind CSS via CDN**: include
+  `<script src="https://cdn.tailwindcss.com"></script>` in `index.html` so
+  the project runs without a PostCSS build step. Use Tailwind utility
+  classes to match the mockup's spacing, colors, radii, shadows, and
+  typography precisely. `style={{ ... }}` inline styles are fine for
+  one-off values Tailwind cannot express.
+- Use semantic elements (`<header>`, `<nav>`, `<main>`, `<section>`,
+  `<button>`) with appropriate `aria-*` / `alt` attributes.
+- Populate components with realistic placeholder data declared inline
+  (arrays of objects). Wire up the interactions visible in the mockup —
+  buttons, inputs, tabs, modals, toggles.
+- Multi-image input → break the UI into per-screen components under
+  `src/components/`, then switch between them from `App.jsx` using
+  `useState` (no need for react-router unless the mockup clearly demands
+  URL-driven routing).
+- Do NOT depend on external image hosts or remote fonts. Use inline SVG,
+  emoji, and Tailwind-only visuals.
+- `package.json` must specify:
+    "dependencies":   { "react": "^18.3.1", "react-dom": "^18.3.1" }
+    "devDependencies":{ "vite": "^5.4.0", "@vitejs/plugin-react": "^4.3.1" }
+    "scripts":        { "dev": "vite", "build": "vite build",
+                        "preview": "vite preview" }
+"""
+
+FLASK_PROMPT = """\
+TARGET STACK: Flask (Python + HTML + CSS, with Bootstrap 5 via CDN)
+
+Project layout to emit:
+  - app.py                       Flask app: imports, routes, __main__ runner
+  - templates/base.html          shared layout w/ Bootstrap 5 CDN + nav
+  - templates/index.html         extends base.html, recreates main mockup
+  - templates/<screen>.html      one per extra mockup image
+  - static/styles.css            custom CSS layered on Bootstrap
+  - requirements.txt             flask + anything else imported
+  - README.md
+
+Flask implementation rules:
+- Use Flask 3.x:
+    from flask import Flask, render_template, request, url_for
+    app = Flask(__name__)
+    @app.route("/")
+    def index(): ...
+    if __name__ == "__main__":
+        app.run(debug=True)
+- Load Bootstrap 5 from the CDN inside `base.html` (link the CSS in <head>
+  and the bundle script before </body>). Use Bootstrap utility classes and
+  components (`navbar`, `card`, `btn`, `container`, `row`, `col`, `form-*`,
+  `modal`, `alert`, ...) as the primary styling layer.
+- Use `static/styles.css` ONLY for things Bootstrap cannot express
+  (custom palette, gradients, exact spacing, Google Font import). Load it
+  with `<link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">`.
+- Use Jinja2 template inheritance: `base.html` defines `{% block title %}`,
+  `{% block content %}`, `{% block extra_css %}`, `{% block extra_js %}`,
+  and every page template `{% extends "base.html" %}`s it.
+- Each route should pass realistic placeholder data into the template via
+  `render_template("...", items=[...], user={...})`. Render that data with
+  Jinja `{% for %}` loops so the page looks alive.
+- Multi-image input → one route + one template per screen, plus matching
+  nav links in `base.html`.
+- Use semantic HTML5 and `alt` / `aria` attributes throughout.
+- `requirements.txt` must include at least `flask>=3.0`.
+"""
+
+_STACK_PROMPTS: dict[str, str] = {
+    "Streamlit": STREAMLIT_PROMPT,
+    "React": REACT_PROMPT,
+    "Flask": FLASK_PROMPT,
+}
+
+_PRIMARY_LANG: dict[str, str] = {
+    "Streamlit": "python",
+    "React": "jsx",
+    "Flask": "python",
+}
+
+_FALLBACK_EXT: dict[str, str] = {"python": "py", "jsx": "jsx"}
+
+# Matches a single   ===FILE: path===\n<body>\n===END===   block.
+_FILE_BLOCK_RE = re.compile(
+    r"=== *FILE: *(?P<path>[^=\n]+?) *===\s*\n"
+    r"(?P<body>.*?)\n"
+    r"=== *END *===",
+    re.DOTALL,
+)
+
+# Matches the trailing   ===EXPLANATION===\n<body>\n===END===   block.
+_EXPLANATION_RE = re.compile(
+    r"=== *EXPLANATION *===\s*\n(?P<body>.*?)\n=== *END *===",
     re.DOTALL,
 )
 
 
-_PREVIEW_CHARS = 240
-
-
-def _preview(text: str, limit: int = _PREVIEW_CHARS) -> str:
-    """Return a short, single-line preview of `text` for error messages."""
-    if not isinstance(text, str):
-        return repr(text)[:limit]
-    flattened = " ".join(text.split())
-    if len(flattened) <= limit:
-        return flattened
-    return flattened[:limit] + "..."
-
-
-def _strip_markdown_fences(text: str) -> Optional[str]:
-    """Return the body inside ```` ```json … ``` ```` or ```` ``` … ``` ```` fences, or None."""
-    match = _FENCE_RE.search(text)
-    if not match:
-        return None
-    body = match.group("body").strip()
-    return body or None
-
-
-def extract_json_from_text(text: str) -> Dict[str, Any]:
-    """Robustly extract a JSON object from arbitrary model output.
-
-    Strategy, attempted in order:
-
-    1. `json.loads(text)` directly.
-    2. If that fails, remove markdown code fences (```` ```json … ``` ```` or
-       generic ```` ``` … ``` ````) and parse the contents.
-    3. If that fails, take the substring from the first `{` to the last
-       `}` (inclusive) and parse it.
-    4. If that fails, raise `ValueError` with a short preview of the
-       response.
-
-    Args:
-        text: The raw response text from the model.
-
-    Returns:
-        The parsed JSON object as a Python dict.
-
-    Raises:
-        ValueError: when no strategy yields a JSON object. The message
-            includes a short preview of the response so the caller can
-            surface it to the user / logs.
-    """
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("Cannot extract JSON: response text is empty.")
-
-    last_error: Optional[Exception] = None
-
-    # Strategy 1: parse the whole response as-is.
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-        last_error = ValueError("Top-level JSON value is not an object.")
-    except json.JSONDecodeError as exc:
-        last_error = exc
-
-    # Strategy 2: strip markdown fences if present, parse what's inside.
-    fenced = _strip_markdown_fences(text)
-    if fenced:
-        try:
-            parsed = json.loads(fenced)
-            if isinstance(parsed, dict):
-                return parsed
-            last_error = ValueError("Top-level JSON value is not an object.")
-        except json.JSONDecodeError as exc:
-            last_error = exc
-
-    # Strategy 3: substring from the first '{' to the last '}'.
-    first = text.find("{")
-    last = text.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        candidate = text[first : last + 1]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-            last_error = ValueError("Top-level JSON value is not an object.")
-        except json.JSONDecodeError as exc:
-            last_error = exc
-
-    # Strategy 4: give up with a clear, previewable error.
-    raise ValueError(
-        "Could not parse JSON from Gemini response. "
-        f"Last parser error: {last_error}. "
-        f"Response preview: {_preview(text)!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Payload validation
-# ---------------------------------------------------------------------------
-
-
-def _coerce_str_list(value: Any) -> List[str]:
-    """Coerce arbitrary model output into a clean list[str]."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        stripped = value.strip()
-        return [stripped] if stripped else []
-    if isinstance(value, list):
-        return [
-            str(item).strip()
-            for item in value
-            if item is not None and str(item).strip()
-        ]
-    return []
-
-
-def _normalize_payload(
-    payload: Dict[str, Any], *, expected_stack: str
-) -> Dict[str, Any]:
-    """Light normalization applied *after* strict schema validation.
-
-    Assumes `payload` already passed `validators.validate_generated_result`
-    (i.e. required keys exist, files have non-empty path + content, paths
-    are relative with no `..`, no duplicates). This function only:
-
-    - Strips whitespace from `project_name` and `summary`.
-    - Lowercases `stack` and overrides it to `expected_stack` if the
-      model drifted (with a warning log).
-    - Coerces `run_instructions` and `notes` to clean `list[str]`.
-    - Normalizes file paths to forward slashes (no traversal cleanup —
-      that's the validator's job to reject upstream).
-    """
-    out: Dict[str, Any] = {}
-
-    out["project_name"] = str(payload.get("project_name", "")).strip()
-
-    raw_stack = str(payload.get("stack", "")).strip().lower()
-    if raw_stack != expected_stack:
-        logger.warning(
-            "Gemini returned stack=%r but %r was requested; overriding.",
-            raw_stack,
-            expected_stack,
-        )
-    out["stack"] = expected_stack
-
-    summary = payload.get("summary", "")
-    out["summary"] = summary.strip() if isinstance(summary, str) else ""
-
-    normalized_files: List[Dict[str, str]] = []
-    for entry in payload.get("files", []):
-        path = str(entry.get("path", "")).strip().replace("\\", "/")
-        content = entry.get("content", "")
-        normalized_files.append({"path": path, "content": content})
-    out["files"] = normalized_files
-
-    out["run_instructions"] = _coerce_str_list(payload.get("run_instructions"))
-    out["notes"] = _coerce_str_list(payload.get("notes"))
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Gemini client + request
-# ---------------------------------------------------------------------------
-
-
-def _build_client(api_key: str):
-    """Construct a `google-genai` Client. Imported lazily."""
-    try:
-        from google import genai  # type: ignore
-    except ImportError as exc:  # pragma: no cover - import guard
-        raise GeminiAPIError(
-            "The 'google-genai' package is not installed. "
-            "Run `pip install -r requirements.txt`."
-        ) from exc
-    try:
-        return genai.Client(api_key=api_key)
-    except Exception as exc:
-        raise GeminiAPIError(f"Failed to initialize Gemini client: {exc}") from exc
-
-
-def _build_contents(prompt: str, images: Sequence[_ImagePart]) -> list:
-    """Build the multimodal `contents` list: prompt + inline image parts."""
-    from google.genai import types  # type: ignore
-
-    contents: list = [prompt]
-    for img in images:
-        contents.append(
-            types.Part.from_bytes(data=img.data, mime_type=img.mime_type)
-        )
-    return contents
-
-
-def _call_gemini(
-    *,
-    api_key: str,
-    prompt: str,
-    images: Sequence[_ImagePart],
-    model_name: str,
+def _build_prompt(
+    tech_stack: str,
+    num_images: int,
+    extra_instructions: str = "",
 ) -> str:
-    """Invoke `client.models.generate_content` and return the response text.
+    """Assemble the final prompt that gets sent to Gemini.
 
-    Raises:
-        RateLimitError: on Gemini 429 / RESOURCE_EXHAUSTED / quota errors.
-            **Not** auto-retried — the caller (UI) is responsible for
-            asking the user to wait.
-        GeminiAPIError: on other network/SDK failures.
-        ValueError: when Gemini returns no usable text.
+    Combines the global quality bar, image-count framing, the stack-specific
+    rules, and the strict ``===FILE:===`` output format.
     """
-    from google.genai import types  # type: ignore
+    if tech_stack not in _STACK_PROMPTS:
+        raise ValueError(
+            f"Unsupported tech_stack: {tech_stack!r}. "
+            f"Choose one of {SUPPORTED_TECH_STACKS}."
+        )
 
-    client = _build_client(api_key)
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
-        response_mime_type="application/json",
-        temperature=0.2,
+    labels = [
+        "primary screen / main landing view",
+        "secondary screen / alternate page or state",
+        "third screen / alternate page or state",
+    ]
+    image_lines = "\n".join(
+        f"  - Image {i + 1}: {labels[i]}" for i in range(num_images)
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=_build_contents(prompt, images),
-            config=config,
+    if num_images == 1:
+        multi_screen_directive = (
+            "There is ONE mockup image. Generate a complete, polished UI for "
+            "that single screen — every visible element should be implemented, "
+            "wired up, and populated with realistic placeholder data."
         )
-    except Exception as exc:  # SDK exceptions vary; surface them uniformly.
-        # 429 / quota errors get their own clean message and never retry.
-        if _is_rate_limit_error(exc):
-            logger.warning("Gemini rate limit hit: %s", exc)
-            raise RateLimitError(RATE_LIMIT_MESSAGE) from exc
-        raise GeminiAPIError(f"Gemini API call failed: {exc}") from exc
+    else:
+        multi_screen_directive = (
+            f"There are {num_images} mockup images. Treat each one as a "
+            "SEPARATE screen / page / state of the same app. Generate "
+            "components/routes/templates so every screen is reachable from a "
+            "single running app, and wire up navigation between them "
+            "(tabs, sidebar links, router state, or a nav bar — whichever "
+            "best matches the mockups)."
+        )
 
-    text = getattr(response, "text", None) or ""
-    if not text.strip():
-        # Some SDK builds expose text only via candidates[].content.parts[].text
-        try:
-            candidates = getattr(response, "candidates", []) or []
-            if candidates:
-                parts = getattr(candidates[0].content, "parts", []) or []
-                text = "".join(getattr(p, "text", "") or "" for p in parts)
-        except Exception:  # pragma: no cover - defensive
-            text = ""
+    prompt = f"""{SYSTEM_PROMPT_BASE}
 
-    if not text.strip():
-        raise ValueError("Invalid response format: Gemini returned no text.")
-    return text
+You were given {num_images} mockup image(s):
+{image_lines}
+
+{multi_screen_directive}
+
+{_STACK_PROMPTS[tech_stack]}
+
+GLOBAL QUALITY BAR (applies to every file you emit):
+- The generated project MUST run end-to-end after the documented install
+  command. No missing imports, no undefined references.
+- No `TODO`, `FIXME`, `pass`, `// TODO`, or "implement this later" stubs.
+  Fill in real code.
+- Realistic placeholder data (not lorem ipsum stubs) so the rendered UI
+  resembles the mockup.
+- Accessible markup: semantic elements, labels for inputs, alt text for
+  images, sensible `aria-*` attributes.
+- Modern, idiomatic style (Python 3.10+, ES2022).
+- README.md must show the exact install + run commands.
+
+==========================================================================
+OUTPUT FORMAT — follow this EXACTLY. No markdown fences. No extra prose.
+==========================================================================
+
+For every file in the project, emit one block of this form:
+
+===FILE: <relative/path/to/file.ext>===
+<full file contents — raw, no surrounding ``` fences>
+===END===
+
+After ALL the file blocks, emit ONE explanation block:
+
+===EXPLANATION===
+<2–4 sentence summary: which screens map to which files, and how to run
+the project>
+===END===
+
+The very first character of your response MUST be `=` (the start of the
+first ``===FILE:`` block). Do not write any prose before, between, or
+after the blocks.
+"""
+
+    if extra_instructions.strip():
+        prompt += (
+            "\nAdditional user requirements — apply these on top of the rules "
+            f"above:\n{extra_instructions.strip()}\n"
+        )
+
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -525,85 +319,231 @@ def _call_gemini(
 # ---------------------------------------------------------------------------
 
 
-def generate_code_from_images(
-    uploaded_files,
-    target_stack: str,
+def generate_code_from_mockscreen(
+    images: list,
+    tech_stack: str,
     extra_instructions: str = "",
-    model_name: str = DEFAULT_MODEL,
-) -> Dict[str, Any]:
-    """Generate a runnable starter project from UI mock screen images.
+    api_key: Optional[str] = None,
+) -> dict:
+    """Generate a runnable project from one or more UI mockup images.
 
     Args:
-        uploaded_files: An iterable of Streamlit `UploadedFile` objects (or
-            any objects exposing `name`, `type`, and either `getvalue()` or
-            `read()`). Must contain 1 to 3 image files (png/jpg/jpeg/webp).
-        target_stack: One of `"streamlit"`, `"react"`, `"flask"`.
-        extra_instructions: Optional free-form notes from the user that are
-            passed verbatim to the model as soft guidance.
-        model_name: Gemini model identifier. Defaults to `"gemini-2.5-flash"`.
+        images: List of 1 to 3 ``PIL.Image.Image`` instances representing the
+            uploaded mockup screens. Image 1 is required; images 2 and 3 are
+            optional and, when present, are treated as additional screens of
+            the same app.
+        tech_stack: Target tech stack — one of ``"Streamlit"``, ``"React"``,
+            or ``"Flask"`` (see :data:`SUPPORTED_TECH_STACKS`).
+        extra_instructions: Optional free-form text appended to the prompt
+            (e.g. "use a dark palette", "make it responsive"). Defaults to
+            an empty string.
+        api_key: Optional override for ``GEMINI_API_KEY``. When omitted, the
+            key is read from the environment (loaded from ``.env``).
 
     Returns:
-        A `dict` matching the project schema documented at the top of this
-        module / in the README. Keys: `project_name`, `stack`, `summary`,
-        `files` (list of `{path, content}`), `run_instructions`, `notes`.
+        A dict with four keys, always present:
+
+        - ``"code"`` *(str)*: All generated files concatenated into a single
+          string with ``# ===== <filename> =====`` separators — handy for a
+          quick preview.
+        - ``"explanation"`` *(str)*: 2–4 sentence summary the model wrote
+          about what it produced. Empty string if the model omitted it.
+        - ``"files"`` *(list[dict])*: One entry per emitted file, each shaped
+          ``{"filename": <relative/path>, "content": <text>}``. Suitable for
+          rendering in Streamlit tabs and for :func:`create_zip_download`.
+        - ``"error"`` *(str | None)*: ``None`` on success, otherwise a
+          human-readable error message describing what went wrong (invalid
+          input, rate limit, empty response, etc.).
+
+    The function never raises — every failure is captured in
+    ``result["error"]`` so callers can render it directly in the UI.
+    """
+    result: dict = {
+        "code": "",
+        "explanation": "",
+        "files": [],
+        "error": None,
+    }
+
+    try:
+        if not images:
+            raise ValueError("At least one mockup image is required.")
+        if len(images) > 3:
+            raise ValueError("At most 3 mockup images are supported.")
+        for idx, img in enumerate(images, start=1):
+            if not isinstance(img, Image.Image):
+                raise ValueError(
+                    f"Image {idx} is not a valid PIL Image instance "
+                    f"(got {type(img).__name__})."
+                )
+
+        _configure_gemini(api_key)
+
+        prompt = _build_prompt(
+            tech_stack=tech_stack,
+            num_images=len(images),
+            extra_instructions=extra_instructions,
+        )
+
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(
+            [prompt, *images],
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 8192,
+            },
+        )
+
+        raw_text = _extract_response_text(response)
+        if not raw_text:
+            raise RuntimeError(
+                "Gemini returned an empty response. Try uploading a clearer "
+                "mockup or rerunning the request."
+            )
+
+        files = _parse_files(raw_text)
+        explanation = _parse_explanation(raw_text)
+
+        if not files:
+            ext = _FALLBACK_EXT.get(_PRIMARY_LANG[tech_stack], "txt")
+            files = [
+                {
+                    "filename": f"generated_output.{ext}",
+                    "content": raw_text,
+                }
+            ]
+
+        result["files"] = files
+        result["code"] = _concatenate_for_preview(files)
+        result["explanation"] = explanation or (
+            f"Generated a {tech_stack} project with {len(files)} file(s) "
+            f"from {len(images)} mockup image(s)."
+        )
+
+    except ValueError as exc:
+        result["error"] = f"Invalid input: {exc}"
+    except Exception as exc:  # noqa: BLE001 - capture SDK / network errors
+        message = str(exc) or exc.__class__.__name__
+        lowered = message.lower()
+        if "rate" in lowered or "429" in lowered or "quota" in lowered:
+            result["error"] = (
+                "Gemini API rate limit / quota exceeded. Wait a few seconds "
+                "and try again, or upgrade your quota. "
+                f"(details: {message})"
+            )
+        elif "image" in lowered and ("format" in lowered or "decode" in lowered):
+            result["error"] = (
+                "Invalid image format. Please upload a PNG or JPG screenshot. "
+                f"(details: {message})"
+            )
+        else:
+            result["error"] = f"Code generation failed: {message}"
+
+    return result
+
+
+def create_zip_download(
+    files: list,
+    project_name: str = "mockscreen_output",
+) -> bytes:
+    """Pack a list of ``{filename, content}`` dicts into a ZIP archive.
+
+    Args:
+        files: List of dicts shaped ``{"filename": str, "content": str}`` —
+            typically the ``"files"`` field returned by
+            :func:`generate_code_from_mockscreen`.
+        project_name: Name of the top-level folder inside the ZIP. Defaults
+            to ``"mockscreen_output"`` so unzipping produces a tidy
+            ``mockscreen_output/...`` directory.
+
+    Returns:
+        The ZIP archive as raw ``bytes``, ready to be handed to
+        ``st.download_button(data=...)``.
 
     Raises:
-        ValueError: when inputs are invalid, when the response cannot be
-            parsed as JSON, or when the parsed payload does not match the
-            expected schema.
-        GeminiAPIError: when the Gemini API call itself fails (missing key,
-            network error, SDK error).
+        ValueError: If ``files`` is empty or any entry is not a dict.
     """
-    # 1. Validate the requested stack.
-    if not isinstance(target_stack, str) or not target_stack.strip():
-        raise ValueError("Target stack is required.")
-    stack = target_stack.strip().lower()
-    if stack not in ALLOWED_STACKS:
-        raise ValueError(
-            f"Unsupported target stack {target_stack!r}. "
-            f"Choose one of: {list(ALLOWED_STACKS)}."
-        )
+    if not files:
+        raise ValueError("Cannot create a ZIP archive from an empty file list.")
 
-    # 2. Resolve the API key. Raised as GeminiAPIError (not ValueError) because
-    #    it is an auth/config problem rather than a response-format problem.
-    api_key = get_api_key()
-    if not api_key:
-        raise GeminiAPIError(
-            "Gemini API key is missing. Add GEMINI_API_KEY to Streamlit "
-            "secrets or environment variables."
-        )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    "Each file entry must be a dict with "
+                    f"'filename' and 'content'; got {type(entry).__name__}."
+                )
+            filename = (entry.get("filename") or "").strip().lstrip("/")
+            content = entry.get("content", "")
+            if not filename:
+                continue
+            zf.writestr(f"{project_name}/{filename}", content)
+    return buffer.getvalue()
 
-    # 3. Validate and load uploaded images.
-    image_parts = _normalize_uploaded_files(uploaded_files)
 
-    # 4. Build the user prompt. The system instruction is also attached
-    #    via GenerateContentConfig(system_instruction=...) inside
-    #    _call_gemini for redundancy.
-    prompt = build_generation_prompt(
-        target_stack=stack,
-        extra_instructions=extra_instructions or "",
-    )
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    # 5. Call Gemini and get raw text.
-    text = _call_gemini(
-        api_key=api_key,
-        prompt=prompt,
-        images=image_parts,
-        model_name=(model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
-    )
 
-    # 6. Robustly extract JSON.
-    raw_payload = extract_json_from_text(text)
+def _extract_response_text(response) -> str:
+    """Pull text out of a Gemini response and surface useful errors.
 
-    # 7. Strictly validate the schema. Any failure here surfaces as a
-    #    ValueError so the UI can present a clear, actionable message.
-    #    We never silently drop invalid file entries — bad input fails.
-    ok, message = validate_generated_result(raw_payload)
-    if not ok:
-        raise ValueError(
-            f"Invalid response format: {message} "
-            f"Response preview: {_preview(text)!r}"
-        )
+    ``response.text`` raises if the candidate was blocked by safety filters
+    or otherwise unusable; we re-raise with the ``prompt_feedback`` payload
+    included so the caller can show something actionable in the UI.
+    """
+    try:
+        text = response.text
+    except Exception as exc:  # noqa: BLE001 - re-raised with extra context
+        feedback = getattr(response, "prompt_feedback", None)
+        raise RuntimeError(
+            "Gemini did not return a usable text response "
+            f"(prompt_feedback={feedback!r}). Underlying error: {exc}"
+        ) from exc
+    return (text or "").strip()
 
-    # 8. Light normalization (whitespace, stack-case, list coercion).
-    return _normalize_payload(raw_payload, expected_stack=stack)
+
+def _parse_files(raw_text: str) -> list[dict]:
+    """Extract every ``===FILE: ... ===END===`` block from the model output."""
+    files: list[dict] = []
+    seen: set[str] = set()
+    for match in _FILE_BLOCK_RE.finditer(raw_text):
+        path = match.group("path").strip().lstrip("/")
+        if not path or path in seen:
+            continue
+        body = _strip_optional_code_fence(match.group("body"))
+        files.append({"filename": path, "content": body})
+        seen.add(path)
+    return files
+
+
+def _parse_explanation(raw_text: str) -> str:
+    """Extract the trailing ``===EXPLANATION===`` block, if present."""
+    match = _EXPLANATION_RE.search(raw_text)
+    return match.group("body").strip() if match else ""
+
+
+def _strip_optional_code_fence(text: str) -> str:
+    """Remove a leading ```lang fence and trailing ``` if the model added one."""
+    body = text.strip("\n")
+    stripped = body.strip()
+    if stripped.startswith("```"):
+        first_nl = stripped.find("\n")
+        if first_nl != -1:
+            inner = stripped[first_nl + 1 :]
+            if inner.rstrip().endswith("```"):
+                inner = inner.rstrip()[:-3].rstrip("\n")
+            return inner
+    return body
+
+
+def _concatenate_for_preview(files: list[dict]) -> str:
+    """Glue every file's content into one string for the ``"code"`` field."""
+    parts: list[str] = []
+    for entry in files:
+        parts.append(f"# ===== {entry['filename']} =====")
+        parts.append(entry["content"])
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
