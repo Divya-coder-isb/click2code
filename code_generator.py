@@ -63,7 +63,52 @@ class GeminiAPIError(RuntimeError):
     """Raised when the Gemini API call fails (auth, network, SDK)."""
 
 
-# Note: invalid response format / shape issues are intentionally raised as
+class RateLimitError(ValueError):
+    """Raised when Gemini responds with 429 / RESOURCE_EXHAUSTED / quota.
+
+    Subclasses `ValueError` so existing handlers that catch `ValueError`
+    continue to display the message without changes, but lets callers
+    branch on a rate-limit failure specifically (e.g. to show a softer
+    `st.warning` instead of a red `st.error`).
+
+    Rate-limit errors are **never** auto-retried by this module — the
+    free tier requires a full ~60s wait. Surfacing the error and letting
+    the user retry manually is the intended UX.
+    """
+
+
+RATE_LIMIT_MESSAGE = (
+    "Rate limit exceeded. You are making requests too quickly for the "
+    "free tier. Please wait 60 seconds and try again. Consider uploading "
+    "fewer images to save tokens."
+)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Heuristic check for a Gemini 429 / RESOURCE_EXHAUSTED / quota error.
+
+    Different parts of the `google-genai` stack expose the status code in
+    different attributes (`code`, `status_code`, `http_status`, `status`)
+    and sometimes only via the stringified message. We check both.
+    """
+    for attr in ("code", "status_code", "http_status", "status"):
+        value = getattr(exc, attr, None)
+        if value == 429:
+            return True
+        if isinstance(value, str) and "429" in value:
+            return True
+
+    message = str(exc)
+    if "429" in message:
+        return True
+    if "RESOURCE_EXHAUSTED" in message:
+        return True
+    if "quota" in message.lower():
+        return True
+    return False
+
+
+# Note: other invalid-response / shape issues are intentionally raised as
 # plain `ValueError` so callers can rely on a stable, well-known exception
 # type for "the model gave us something we couldn't use".
 
@@ -431,7 +476,10 @@ def _call_gemini(
     """Invoke `client.models.generate_content` and return the response text.
 
     Raises:
-        GeminiAPIError: on network/SDK failures.
+        RateLimitError: on Gemini 429 / RESOURCE_EXHAUSTED / quota errors.
+            **Not** auto-retried — the caller (UI) is responsible for
+            asking the user to wait.
+        GeminiAPIError: on other network/SDK failures.
         ValueError: when Gemini returns no usable text.
     """
     from google.genai import types  # type: ignore
@@ -450,6 +498,10 @@ def _call_gemini(
             config=config,
         )
     except Exception as exc:  # SDK exceptions vary; surface them uniformly.
+        # 429 / quota errors get their own clean message and never retry.
+        if _is_rate_limit_error(exc):
+            logger.warning("Gemini rate limit hit: %s", exc)
+            raise RateLimitError(RATE_LIMIT_MESSAGE) from exc
         raise GeminiAPIError(f"Gemini API call failed: {exc}") from exc
 
     text = getattr(response, "text", None) or ""
