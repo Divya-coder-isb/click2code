@@ -18,6 +18,7 @@ import streamlit as st
 from code_generator import (
     DEFAULT_MODEL,
     GeminiAPIError,
+    ModelUnavailableError,
     RateLimitError,
     generate_code_from_images,
     get_api_key,
@@ -65,6 +66,7 @@ KNOWN_MODELS: List[str] = [
 SESSION_KEY_RESULT = "last_result"
 SESSION_KEY_ERROR = "last_error"
 SESSION_KEY_ERROR_SEVERITY = "last_error_severity"  # "error" | "warning"
+SESSION_KEY_ERROR_KIND = "last_error_kind"  # "rate_limit" | "unavailable" | "other"
 
 MISSING_API_KEY_MESSAGE = (
     "Gemini API key is missing. Add GEMINI_API_KEY to Streamlit secrets "
@@ -162,18 +164,31 @@ def _init_session_state() -> None:
         st.session_state[SESSION_KEY_ERROR] = None
     if SESSION_KEY_ERROR_SEVERITY not in st.session_state:
         st.session_state[SESSION_KEY_ERROR_SEVERITY] = "error"
+    if SESSION_KEY_ERROR_KIND not in st.session_state:
+        st.session_state[SESSION_KEY_ERROR_KIND] = "other"
 
 
-def _record_error(message: str, *, severity: str = "error") -> None:
-    """Helper: store an error message + its display severity in session state."""
+def _record_error(
+    message: str,
+    *,
+    severity: str = "error",
+    kind: str = "other",
+) -> None:
+    """Store an error message, its display severity, and its kind.
+
+    `kind` lets the status pill differentiate between specific transient
+    failures (rate limit vs. unavailable) without parsing message text.
+    """
     st.session_state[SESSION_KEY_RESULT] = None
     st.session_state[SESSION_KEY_ERROR] = message
     st.session_state[SESSION_KEY_ERROR_SEVERITY] = severity
+    st.session_state[SESSION_KEY_ERROR_KIND] = kind
 
 
 def _clear_error() -> None:
     st.session_state[SESSION_KEY_ERROR] = None
     st.session_state[SESSION_KEY_ERROR_SEVERITY] = "error"
+    st.session_state[SESSION_KEY_ERROR_KIND] = "other"
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +343,7 @@ _STATUS_LABELS = {
     "done": ("status-done", "✅ Code generated"),
     "error": ("status-error", "⚠️ Generation failed"),
     "rate_limited": ("status-generating", "⏳ Rate limited — wait ~60s and retry"),
+    "unavailable": ("status-generating", "⏳ Gemini temporarily unavailable — try again in a moment"),
 }
 
 
@@ -347,9 +363,17 @@ def _determine_status(
     has_result: bool,
     has_error: bool,
     error_severity: str = "error",
+    error_kind: str = "other",
 ) -> str:
     if has_error:
-        return "rate_limited" if error_severity == "warning" else "error"
+        if error_severity == "warning":
+            if error_kind == "rate_limit":
+                return "rate_limited"
+            if error_kind == "unavailable":
+                return "unavailable"
+            # Generic transient warning — reuse the amber rate-limited pill.
+            return "rate_limited"
+        return "error"
     if has_result:
         return "done"
     if len(uploaded_files) >= MIN_IMAGES:
@@ -423,19 +447,24 @@ def _do_generation(
         st.session_state[SESSION_KEY_RESULT] = project
         _clear_error()
     except RateLimitError as exc:
-        # Subclass of ValueError — must be caught FIRST. Recoverable:
-        # we surface it as a yellow warning rather than a red error
-        # and never auto-retry.
+        # Subclass of ValueError — must be caught BEFORE the generic
+        # ValueError. Recoverable: we surface it as a yellow warning
+        # rather than a red error and never auto-retry.
         logger.info("Rate limited by Gemini: %s", exc)
-        _record_error(str(exc), severity="warning")
+        _record_error(str(exc), severity="warning", kind="rate_limit")
+    except ModelUnavailableError as exc:
+        # Sibling of RateLimitError. 503 UNAVAILABLE: transient server
+        # overload, no retry, soft warning, user retries manually.
+        logger.info("Gemini model unavailable: %s", exc)
+        _record_error(str(exc), severity="warning", kind="unavailable")
     except ValueError as exc:
         # Invalid inputs or invalid model response format.
-        _record_error(str(exc), severity="error")
+        _record_error(str(exc), severity="error", kind="other")
     except GeminiAPIError as exc:
-        _record_error(f"Gemini API error: {exc}", severity="error")
+        _record_error(f"Gemini API error: {exc}", severity="error", kind="other")
     except Exception as exc:  # last-resort safety net
         logger.exception("Unexpected error during generation")
-        _record_error(f"Unexpected error: {exc}", severity="error")
+        _record_error(f"Unexpected error: {exc}", severity="error", kind="other")
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +612,7 @@ def main() -> None:
             has_result=st.session_state.get(SESSION_KEY_RESULT) is not None,
             has_error=bool(st.session_state.get(SESSION_KEY_ERROR)),
             error_severity=st.session_state.get(SESSION_KEY_ERROR_SEVERITY, "error"),
+            error_kind=st.session_state.get(SESSION_KEY_ERROR_KIND, "other"),
         ),
     )
 
@@ -624,8 +654,9 @@ def main() -> None:
             extra_instructions=sidebar_state["extra_instructions"],
         )
 
-        # Reflect final state in the badge. Rate-limit errors get their
-        # own amber pill; hard errors get the red one.
+        # Reflect final state in the badge. Transient errors (rate
+        # limit, 503 unavailable) get their own amber pills; hard errors
+        # get the red one.
         _set_status(
             status_placeholder,
             _determine_status(
@@ -633,6 +664,7 @@ def main() -> None:
                 has_result=st.session_state.get(SESSION_KEY_RESULT) is not None,
                 has_error=bool(st.session_state.get(SESSION_KEY_ERROR)),
                 error_severity=st.session_state.get(SESSION_KEY_ERROR_SEVERITY, "error"),
+                error_kind=st.session_state.get(SESSION_KEY_ERROR_KIND, "other"),
             ),
         )
 
