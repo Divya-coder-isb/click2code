@@ -18,6 +18,7 @@ import streamlit as st
 from code_generator import (
     DEFAULT_MODEL,
     GeminiAPIError,
+    RateLimitError,
     generate_code_from_images,
     get_api_key,
 )
@@ -63,6 +64,7 @@ KNOWN_MODELS: List[str] = [
 
 SESSION_KEY_RESULT = "last_result"
 SESSION_KEY_ERROR = "last_error"
+SESSION_KEY_ERROR_SEVERITY = "last_error_severity"  # "error" | "warning"
 
 MISSING_API_KEY_MESSAGE = (
     "Gemini API key is missing. Add GEMINI_API_KEY to Streamlit secrets "
@@ -158,6 +160,20 @@ def _init_session_state() -> None:
         st.session_state[SESSION_KEY_RESULT] = None
     if SESSION_KEY_ERROR not in st.session_state:
         st.session_state[SESSION_KEY_ERROR] = None
+    if SESSION_KEY_ERROR_SEVERITY not in st.session_state:
+        st.session_state[SESSION_KEY_ERROR_SEVERITY] = "error"
+
+
+def _record_error(message: str, *, severity: str = "error") -> None:
+    """Helper: store an error message + its display severity in session state."""
+    st.session_state[SESSION_KEY_RESULT] = None
+    st.session_state[SESSION_KEY_ERROR] = message
+    st.session_state[SESSION_KEY_ERROR_SEVERITY] = severity
+
+
+def _clear_error() -> None:
+    st.session_state[SESSION_KEY_ERROR] = None
+    st.session_state[SESSION_KEY_ERROR_SEVERITY] = "error"
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +327,7 @@ _STATUS_LABELS = {
     "generating": ("status-generating", "✨ Generating code with Gemini..."),
     "done": ("status-done", "✅ Code generated"),
     "error": ("status-error", "⚠️ Generation failed"),
+    "rate_limited": ("status-generating", "⏳ Rate limited — wait ~60s and retry"),
 }
 
 
@@ -325,10 +342,14 @@ def _set_status(placeholder: Any, state: str) -> None:
 
 
 def _determine_status(
-    *, uploaded_files: List[object], has_result: bool, has_error: bool
+    *,
+    uploaded_files: List[object],
+    has_result: bool,
+    has_error: bool,
+    error_severity: str = "error",
 ) -> str:
     if has_error:
-        return "error"
+        return "rate_limited" if error_severity == "warning" else "error"
     if has_result:
         return "done"
     if len(uploaded_files) >= MIN_IMAGES:
@@ -384,7 +405,13 @@ def _do_generation(
     uploaded_files: List[object],
     extra_instructions: str,
 ) -> None:
-    """Call the generator and store the result/error in session state."""
+    """Call the generator and store the result/error in session state.
+
+    All exceptions are converted into a user-friendly message stored on
+    session state. The UI layer renders them via `st.warning` (for
+    transient / recoverable conditions like rate limits) or `st.error`
+    (for hard failures).
+    """
     try:
         with st.spinner("Generating code with Gemini..."):
             project = generate_code_from_images(
@@ -394,17 +421,21 @@ def _do_generation(
                 model_name=model,
             )
         st.session_state[SESSION_KEY_RESULT] = project
-        st.session_state[SESSION_KEY_ERROR] = None
+        _clear_error()
+    except RateLimitError as exc:
+        # Subclass of ValueError — must be caught FIRST. Recoverable:
+        # we surface it as a yellow warning rather than a red error
+        # and never auto-retry.
+        logger.info("Rate limited by Gemini: %s", exc)
+        _record_error(str(exc), severity="warning")
     except ValueError as exc:
-        st.session_state[SESSION_KEY_RESULT] = None
-        st.session_state[SESSION_KEY_ERROR] = str(exc)
+        # Invalid inputs or invalid model response format.
+        _record_error(str(exc), severity="error")
     except GeminiAPIError as exc:
-        st.session_state[SESSION_KEY_RESULT] = None
-        st.session_state[SESSION_KEY_ERROR] = f"Gemini API error: {exc}"
+        _record_error(f"Gemini API error: {exc}", severity="error")
     except Exception as exc:  # last-resort safety net
         logger.exception("Unexpected error during generation")
-        st.session_state[SESSION_KEY_RESULT] = None
-        st.session_state[SESSION_KEY_ERROR] = f"Unexpected error: {exc}"
+        _record_error(f"Unexpected error: {exc}", severity="error")
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +582,7 @@ def main() -> None:
             uploaded_files=uploaded_files,
             has_result=st.session_state.get(SESSION_KEY_RESULT) is not None,
             has_error=bool(st.session_state.get(SESSION_KEY_ERROR)),
+            error_severity=st.session_state.get(SESSION_KEY_ERROR_SEVERITY, "error"),
         ),
     )
 
@@ -592,15 +624,28 @@ def main() -> None:
             extra_instructions=sidebar_state["extra_instructions"],
         )
 
-        # Reflect final state in the badge.
+        # Reflect final state in the badge. Rate-limit errors get their
+        # own amber pill; hard errors get the red one.
         _set_status(
             status_placeholder,
-            "done" if st.session_state.get(SESSION_KEY_RESULT) is not None else "error",
+            _determine_status(
+                uploaded_files=uploaded_files,
+                has_result=st.session_state.get(SESSION_KEY_RESULT) is not None,
+                has_error=bool(st.session_state.get(SESSION_KEY_ERROR)),
+                error_severity=st.session_state.get(SESSION_KEY_ERROR_SEVERITY, "error"),
+            ),
         )
 
     # --- Error surface ---
-    if st.session_state.get(SESSION_KEY_ERROR):
-        st.error(st.session_state[SESSION_KEY_ERROR])
+    # Rate-limit failures are transient/recoverable, so we show them as
+    # a yellow warning. Everything else uses the red error banner.
+    error_message = st.session_state.get(SESSION_KEY_ERROR)
+    if error_message:
+        severity = st.session_state.get(SESSION_KEY_ERROR_SEVERITY, "error")
+        if severity == "warning":
+            st.warning(error_message, icon="⏳")
+        else:
+            st.error(error_message)
 
     # --- Results (metric row + 4 tabs) ---
     result: Optional[Dict[str, Any]] = st.session_state.get(SESSION_KEY_RESULT)
@@ -610,7 +655,7 @@ def main() -> None:
         st.divider()
         if st.button("Clear result", use_container_width=False):
             st.session_state[SESSION_KEY_RESULT] = None
-            st.session_state[SESSION_KEY_ERROR] = None
+            _clear_error()
             st.rerun()
 
     # --- Footer ---
